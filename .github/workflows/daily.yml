@@ -1,0 +1,92 @@
+name: 每日刷新数据
+
+# 北京时间 17:30 = UTC 09:30（A 股收盘后，当天的行情/除息都进来了）
+on:
+  schedule:
+    - cron: '30 9 * * *'
+  workflow_dispatch:            # 也能在 Actions 页手动点一下跑
+  push:                         # 改了管线/口径推上来就立刻重跑一遍（不用找按钮）。
+    branches: [main]            # ⚠️ 不会死循环：workflow 推 data 分支用的是 GITHUB_TOKEN，
+                                #    GitHub 对它的推送【不触发 workflow】
+
+permissions:
+  contents: write               # 要能往 data 分支推
+
+env:
+  TZ: Asia/Shanghai             # 管线里 date.today() 要按北京时间算窗口
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 装依赖
+        run: pip install --quiet -r requirements.txt
+
+      # 增量脚本靠 ui_data.json 拿"要算哪些标的"的清单。仓库里那份是种子（首次用），
+      # 之后每天都拿 data 分支上最新的那份 —— 否则 config.py 里加了新标的，
+      # 云端算的还是老清单，而且不会有任何报错。
+      - name: 取上一版 ui_data.json 当标的清单
+        run: |
+          git fetch --depth=1 origin data || true
+          if git show origin/data:ui_data.json > /tmp/prev.json 2>/dev/null; then
+            mv /tmp/prev.json ui_data.json && echo "用 data 分支上的（$(wc -c < ui_data.json) 字节）"
+          else
+            echo "data 分支还没有，用仓库里的种子"
+          fi
+
+      - name: 找回上次的缓存
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: cache-${{ github.run_id }}
+          restore-keys: cache-
+
+      # ⚠️ rebuild_div.py 是"缺了才抓"（且没有 --force）。不删缓存的话，
+      #    新出的分红方案/除息日永远进不来 —— 日历会一直停在种子的那天。
+      - name: 分红明细（每天全量重抓）
+        run: |
+          rm -f cache/div_detail2.json cache/yield2.json
+          python rebuild_div.py
+
+      - name: 股息率分位 + 价格位置（要看今天的价，强制重算）
+        run: python build_yield_hist.py --force
+
+      # 4 分钟、1600 个请求，没必要天天跑：缺了（首次）或每月 1 号才跑
+      - name: 财务 5 年序列（每月 1 号）
+        run: |
+          if [ ! -s cache/fundamentals.json ] || [ "$(date +%d)" = "01" ]; then
+            python build_fundamentals.py
+          else
+            echo "跳过（每月 1 号才跑）"
+          fi
+
+      - name: 公司概况 + 主营构成（增量）
+        run: python build_profile.py
+
+      - name: ETF 历史表现
+        run: python build_etf_perf.py
+
+      - name: 汇总成 ui_data.json
+        run: python export_ui_data.py
+
+      - name: 发布到 data 分支（只保留一个 commit）
+        run: |
+          test -s ui_data.json
+          mkdir -p /tmp/out && cp ui_data.json /tmp/out/
+          cd /tmp/out
+          git init -q
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b data
+          git add ui_data.json
+          git commit -qm "data $(date -u +%F)"
+          git push -q --force \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data
+          echo "已发布 ui_data.json（$(( $(wc -c < ui_data.json) / 1024 )) KB）"
