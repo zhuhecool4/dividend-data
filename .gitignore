@@ -1,0 +1,9 @@
+# 增量缓存：云端每天重算，不入库（提交了就再也不会更新）
+cache/div_detail2.json
+cache/yield2.json
+cache/yield_hist.json
+cache/fundamentals.json
+cache/profile.json
+cache/etf_perf.json
+__pycache__/
+*.pyc
